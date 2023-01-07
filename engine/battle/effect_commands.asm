@@ -243,7 +243,7 @@ BattleCommand_checkturn:
 	ld a, BATTLE_VARS_STATUS
 	call GetBattleVarAddr
 	ld a, [hl]
-	and SLP
+	and SLP_MASK
 	jr z, .not_asleep
 
 	dec [hl]
@@ -453,8 +453,6 @@ EndTurn:
 	ld [wMoveState], a
 	jmp ResetDamage
 
-OpponentCantMove:
-	call CallOpponentTurn
 CantMove:
 	call .cancel_fly_dig
 	call CheckRampageStatusAndGetRolloutCount ; hl becomes pointer to user substatus3
@@ -462,10 +460,9 @@ CantMove:
 	ld a, [de]
 	dec a
 	push hl
-	call z, HandleRampage_ConfuseUser  ; confuses user on last turn of rampage
+	call z, HandleRampage_ConfuseUser ; confuses user on last turn of rampage
 	pop hl
 .rampage_done
-	ld a, [hl]
 	ld a, ~(1 << SUBSTATUS_RAMPAGE | 1 << SUBSTATUS_CHARGED | 1 << SUBSTATUS_FLYING | 1 << SUBSTATUS_UNDERGROUND | 1 << SUBSTATUS_ROLLOUT)
 	and [hl]
 	ld [hl], a
@@ -793,7 +790,7 @@ BattleCommand_checkobedience:
 	call BattleRandom
 	add a
 	swap a
-	and SLP
+	and SLP_MASK
 	jr z, .Nap
 
 	ld [wBattleMonStatus], a
@@ -938,7 +935,7 @@ IgnoreSleepOnly:
 
 	ld a, BATTLE_VARS_STATUS
 	call GetBattleVar
-	and SLP
+	and SLP_MASK
 	ret z
 
 ; 'ignored orders…sleeping!'
@@ -967,19 +964,6 @@ BattleCommand_doturn:
 	call CheckUserIsCharging
 	ret nz
 
-	ldh a, [hBattleTurn]
-	and a
-	ld hl, wPlayerTurnsTaken
-	jr z, .got_turns_taken
-	ld hl, wEnemyTurnsTaken
-.got_turns_taken
-	; If we've gotten this far, this counts as a turn.
-	inc [hl]
-	ld a, [hl]
-	and a
-	jr nz, .no_overflow
-	dec [hl]
-.no_overflow
 	; check if we're locked in to a multi-turn move
 	ld a, BATTLE_VARS_SUBSTATUS3
 	call GetBattleVar
@@ -1104,39 +1088,17 @@ BattleCommand_critical:
 	call GetFutureSightUser
 	ld c, 0
 	jr nz, .Ability
-	ldh a, [hBattleTurn]
-	and a
-	jr nz, .EnemyTurn
 
-	ld hl, wBattleMonItem
-	ld a, [wBattleMonSpecies]
-	jr .Item
-
-.EnemyTurn:
-	ld hl, wEnemyMonItem
-	ld a, [wEnemyMonSpecies]
-
-.Item:
+	call GetUserItemAfterUnnerve
 	ld c, 0
-
-	cp CHANSEY
-	jr nz, .Farfetchd
 	ld a, [hl]
 	cp LUCKY_PUNCH
+	jr z, .crit_item
+	cp LEEK
 	jr nz, .FocusEnergy
-
-; +2 critical level
-	ld c, 2
-	jr .FocusEnergy
-
-.Farfetchd:
-	cp FARFETCH_D
+.crit_item
+	call UserValidBattleItem
 	jr nz, .FocusEnergy
-	ld a, [hl]
-	cp STICK
-	jr nz, .FocusEnergy
-
-; +2 critical level
 	ld c, 2
 	; fallthrough
 
@@ -1196,6 +1158,92 @@ BattleCommand_critical:
 	ld a, 1
 	ld [wCriticalHit], a
 	ret
+
+TrueUserValidBattleItem:
+; Items (and Abilities) never apply to external Future Sight users.
+	call GetFutureSightUser
+	ret nz
+	jr UserValidBattleItem
+
+OpponentValidBattleItem:
+	call CallOpponentTurn
+UserValidBattleItem:
+; Checks if the user's held item applies to the species+form.
+; Used for items like Leek, Lucky Punch, Thick Club, etc.
+; Returns z if the item is valid.
+	push hl
+	push de
+	push bc
+
+	; Get item, species and form data.
+	ld hl, wBattleMonItem
+	call GetUserMonAttr
+	ld a, [hl]
+	ld de, wBattleMonSpecies - wBattleMonItem
+	add hl, de
+	ld c, [hl]
+	ld de, wBattleMonForm - wBattleMonSpecies
+	add hl, de
+	ld b, [hl]
+	ld d, a
+	ld hl, .ValidBattleItemTable
+
+.loop
+	; Check if we reached the end of the table.
+	ld a, [hli]
+	inc a
+	jr z, .failed
+
+	; Does the item match the held one?
+	dec a
+	cp d
+	ld a, [hli]
+	jr nz, .next
+
+	; Does the item apply to the species?
+	cp c
+	jr nz, .next
+
+	; Check exact species+form.
+	ld a, [hl]
+	xor b
+	jr z, .matched
+
+	; If this isn't just a form mismatch, species is wrong.
+	cp EXTSPECIES_MASK
+	jr nc, .next
+
+	; Otherwise, see if the table explicitly defines a form. If it doesn't,
+	; i.e. form=0, any form is OK.
+	xor b ; Reverses previous xor
+	and FORM_MASK
+	jr z, .matched
+.next
+	inc hl
+	jr .loop
+.matched
+	xor a
+	jr .done
+.failed
+	or 1
+.done
+	jmp PopBCDEHL
+
+MACRO species_battle_item
+	db \1
+	shift
+	dp \#
+ENDM
+
+.ValidBattleItemTable:
+	species_battle_item LIGHT_BALL, PIKACHU
+	species_battle_item LEEK, FARFETCH_D
+	species_battle_item LEEK, SIRFETCH_D
+	species_battle_item LUCKY_PUNCH, CHANSEY
+	species_battle_item QUICK_POWDER, DITTO
+	species_battle_item THICK_CLUB, CUBONE
+	species_battle_item THICK_CLUB, MAROWAK
+	db -1
 
 CheckAirBalloon:
 ; Returns z if the user is holding an Air Balloon
@@ -1895,7 +1943,7 @@ BattleCommand_checkhit:
 
 	ld a, BATTLE_VARS_STATUS_OPP
 	call GetBattleVar
-	and SLP
+	and SLP_MASK
 	ret
 
 .Protect:
@@ -2058,6 +2106,40 @@ BattleCommand_checkhit:
 	or 1
 	ret
 
+BattleCommand_checkpriority:
+; Checks for abilities and conditions that would block priority moves from occuring
+	call HasOpponentFainted
+	ret z
+	farcall GetMovePriority
+	cp $81
+	jr c, .check_prankster
+	; Armor Tail blocks moves with priority > 0 (so does not block moves like Prankster Roar)
+	call GetOpponentAbilityAfterMoldBreaker
+	cp ARMOR_TAIL
+	ld b, ATKFAIL_ABILITY
+	jr z, .attack_fails
+	; Dark-type are immune to (most) Prankster-boosted moves that could affect it
+.check_prankster
+	call GetTrueUserAbility
+	cp PRANKSTER
+	ret nz
+	ld a, BATTLE_VARS_MOVE_CATEGORY
+	call GetBattleVar
+	cp STATUS
+	ret nz
+	call CheckIfTargetIsDarkType
+	ret nz
+	ld b, ATKFAIL_IMMUNE
+.attack_fails
+	xor a
+	ld [wTypeMatchup], a
+	ld [wTypeModifier], a
+	ld hl, wAttackMissed
+	or [hl]
+	jmp nz, BattleCommand_failuretext
+	ld [hl], b
+	jmp BattleCommand_failuretext
+
 BattleCommand_effectchance:
 ; Doesn't work against Substitute or Shield Dust
 	push bc
@@ -2095,7 +2177,7 @@ _CheckEffectChance:
 	cp SERENE_GRACE
 	jr nz, .skip_serene_grace
 	sla b
-	jr c, EffectChanceEnd ; The effect byte overflowed, so gurantee it
+	jr c, EffectChanceEnd ; The effect byte overflowed, so guarantee it
 
 .skip_serene_grace
 	ld a, 100
@@ -2200,8 +2282,6 @@ BattleCommand_moveanimnosub:
 	jr z, .pursuit
 	cp EFFECT_MULTI_HIT
 	jr z, .multihit
-	cp EFFECT_FURY_STRIKES
-	jr z, .fury_strikes
 	cp EFFECT_CONVERSION
 	jr z, .conversion
 	cp EFFECT_DOUBLE_HIT
@@ -2235,7 +2315,6 @@ BattleCommand_moveanimnosub:
 	and 1
 	xor 1
 	ld [wKickCounter], a
-.fury_attack
 	ld a, [de]
 	cp $1
 	push af
@@ -2249,23 +2328,6 @@ BattleCommand_moveanimnosub:
 	ld [wNumHits], a
 	jmp PlayFXAnimID
 
-; Fury Swipes and Fury Attack were merged into Fury Strikes, so use the correct
-; animation for the Pokémon that learned each one
-.fury_strikes
-	push de
-	ldh a, [hBattleTurn]
-	and a
-	ld a, [wBattleMonSpecies]
-	jr z, .got_user_species
-	ld a, [wEnemyMonSpecies]
-.got_user_species
-	ld hl, FuryAttackUsers
-	call IsInByteArray
-	pop de
-	jr nc, .multihit
-	ld a, $2
-	ld [wKickCounter], a
-	jr .fury_attack
 
 StatUpDownAnim:
 	ld a, [wAnimationsDisabled]
@@ -2279,40 +2341,8 @@ StatUpDownAnim:
 
 	xor a
 	ld [wNumHits], a
-
-; Defense Curl, Withdraw, and Harden were merged, so use the correct
-; animation for the Pokémon that learned each one
-	ld a, BATTLE_VARS_MOVE_ANIM
-	call GetBattleVar
-	ld e, a
-	ld d, 0
-	cp DEFENSE_CURL
-	jr nz, .not_defense_curl
-	ldh a, [hBattleTurn]
-	and a
-	ld a, [wBattleMonSpecies]
-	jr z, .got_user_species
-	ld a, [wEnemyMonSpecies]
-.got_user_species
-	push af
-	ld hl, WithdrawUsers
-	call IsInByteArray
-	jr nc, .not_withdraw
-	pop af
-	ld a, $1
-	jr .got_kick_counter
-.not_withdraw
-	pop af ; restore species to a
-	inc hl ; ld hl, HardenUsers
-	call IsInByteArray
-	jr nc, .not_harden
-	ld a, $2
-	jr .got_kick_counter
-.not_harden
-.not_defense_curl
-	xor a
-.got_kick_counter
 	ld [wKickCounter], a
+
 	ld a, BATTLE_VARS_MOVE_ANIM
 	call GetBattleVar
 	ld e, a
@@ -2360,8 +2390,6 @@ BattleCommand_failuretext:
 	cp EFFECT_MULTI_HIT
 	jr z, .multihit
 	cp EFFECT_DOUBLE_HIT
-	jr z, .multihit
-	cp EFFECT_FURY_STRIKES
 	jmp nz, EndMoveEffect
 
 .multihit
@@ -2595,6 +2623,30 @@ BattleCommand_criticaltext:
 	ld hl, CriticalHitText
 	call StdBattleTextbox
 
+; Add 1 to the critical hit count if it's the player's turn
+	ld a, [wLinkMode]
+	and a
+	jr nz, .cont
+	ld a, [wInBattleTowerBattle]
+	and a
+	jr nz, .cont
+	ldh a, [hBattleTurn]
+	and a
+	jr nz, .cont
+	ld hl, wCriticalCount
+	ld a, [wCurBattleMon]
+	ld c, a
+	ld b, 0
+	add hl, bc
+	inc [hl]
+	ld a, [hl]
+	cp 3
+	jr c, .cont
+	ld b, SET_FLAG
+	ld hl, wEvolvableFlags
+	predef FlagPredef ; c still contains wCurBatlteMon
+
+.cont
 	xor a
 	ld [wCriticalHit], a
 
@@ -2725,12 +2777,12 @@ BattleCommand_supereffectivetext:
 
 .weakness_policy
 	call SwitchTurn
+	ld b, 0
+	push bc
 	ld a, STAT_SKIPTEXT
 	ld b, $10 | ATTACK
 	call _RaiseStat
 	ld a, [wFailedMessage]
-	ld b, 0
-	push bc
 	and a
 	jr nz, .atk_done
 	farcall UseStatItemText
@@ -2995,6 +3047,9 @@ BattleCommand_posthiteffects:
 	jr .rocky_helmet_done
 
 .offend_hit
+	call GetFutureSightUser
+	jr nc, .rocky_helmet_done
+
 	ld a, BATTLE_VARS_MOVE_CATEGORY
 	call GetBattleVar
 	cp c
@@ -3241,6 +3296,8 @@ EndMoveDamageChecks:
 	cp HELD_SWITCH
 .deferred_switch
 	ret nz
+	call GetFutureSightUser
+	ret nc
 	ld a, c
 	jmp SetDeferredSwitch
 
@@ -3258,6 +3315,8 @@ EndMoveDamageChecks:
 	jr .deferred_switch
 
 .shell_bell
+	call GetFutureSightUser
+	ret nc
 	farcall CheckFullHP
 	ret z
 	ld a, [wDamageTaken]
@@ -3335,17 +3394,25 @@ RaiseStatWithItem:
 	jmp ConsumeUserItem
 
 DittoMetalPowder:
+	assert !HIGH(DITTO)
 if !DEF(FAITHFUL)
 	; grabs true species -- works even if transformed to non-Ditto
+	ld a, MON_FORM
+	call OpponentPartyAttr
+	and EXTSPECIES_MASK
+	ret nz
 	ld a, MON_SPECIES
 	call OpponentPartyAttr
 else
 	; only works if current species is Ditto
-	push hl
+	ld hl, wBattleMonForm
+	call GetOpponentMonAttr
+	ld a, [hl]
+	and EXTSPECIES_MASK
+	ret nz
 	ld hl, wBattleMonSpecies
 	call GetOpponentMonAttr
 	ld a, [hl]
-	pop hl
 endc
 	cp DITTO
 	ret nz
@@ -3356,22 +3423,7 @@ endc
 	cp METAL_POWDER
 	pop bc
 	ret nz
-
-	ld a, c
-	srl a
-	add c
-	ld c, a
-	ret nc
-
-	srl b
-	ld a, b
-	and a
-	jr nz, .done
-	inc b
-.done
-	scf
-	rr c
-	ret
+	jr SetDefenseBoost
 
 UnevolvedEviolite:
 	push hl
@@ -3386,16 +3438,10 @@ UnevolvedEviolite:
 	and SPECIESFORM_MASK
 	ld b, a
 	; bc = index
-	call GetSpeciesAndFormIndex
-	dec bc
-	ld hl, EvosAttacksPointers
-	add hl, bc
-	add hl, bc
-	ld a, BANK(EvosAttacksPointers)
-	call GetFarWord
+	predef GetEvosAttacksPointer
 	ld a, BANK(EvosAttacks)
 	call GetFarByte
-	and a
+	inc a
 	pop bc
 	pop hl
 	ret z
@@ -3406,21 +3452,16 @@ UnevolvedEviolite:
 	cp EVIOLITE
 	pop bc
 	ret nz
-
-	ld a, c
-	srl a
-	add c
-	ld c, a
-	ret nc
-
+	; fallthrough
+SetDefenseBoost:
+; Boosts defense in bc by x1.5. Assumes bc<43690
+	ld h, b
+	ld l, c
 	srl b
-	ld a, b
-	and a
-	jr nz, .done
-	inc b
-.done
-	scf
 	rr c
+	add hl, bc
+	ld b, h
+	ld c, l
 	ret
 
 BattleCommand_damagestats:
@@ -3450,6 +3491,8 @@ BattleCommand_damagestats:
 if !DEF(FAITHFUL)
 	call HailDefenseBoost
 endc
+	call DittoMetalPowder
+	call UnevolvedEviolite
 
 	ld hl, wBattleMonAttack
 	call GetUserMonAttr
@@ -3482,13 +3525,14 @@ endc
 	cp EFFECT_PSYSTRIKE
 	jr z, .psystrike
 
-	ld hl, wBattleMonSpclDef
+	ld hl, wBattleMonSpDef
 	call GetOpponentMonAttr
 	ld a, [hli]
 	ld b, a
 	ld c, [hl]
 
 	call SandstormSpDefBoost
+	call UnevolvedEviolite
 
 	jr .lightscreen
 
@@ -3500,7 +3544,7 @@ endc
 	ld c, [hl]
 
 .lightscreen
-	ld hl, wBattleMonSpclAtk
+	ld hl, wBattleMonSpAtk
 	call GetUserMonAttr
 	call GetFutureSightUser
 	jr z, .sat_ok
@@ -3526,11 +3570,17 @@ endc
 
 .lightball
 ; Note: Returns player special attack at hl in hl.
+	ld a, [hli]
+	ld l, [hl]
+	ld h, a
 	call LightBallBoost
 	jr .done
 
 .thickcluborlightball
 ; Note: Returns player attack at hl in hl.
+	ld a, [hli]
+	ld l, [hl]
+	ld h, a
 	call ThickClubOrLightBallBoost
 
 .done
@@ -3541,8 +3591,6 @@ endc
 	call TrueUserPartyAttr
 	pop hl
 	ld e, a
-	call DittoMetalPowder
-	call UnevolvedEviolite
 
 	ld a, 1
 	and a
@@ -3577,72 +3625,34 @@ TruncateHL_BC:
 	ret
 
 ThickClubOrLightBallBoost:
-; Return in hl the stat value at hl.
-
 ; If the attacking monster is Cubone or Marowak and
 ; it's holding a Thick Club, or if it's Pikachu and
 ; it's holding a Light Ball, double it.
+	ld a, THICK_CLUB
+	call CheckAttackItemBoost
+	; fallthrough
+LightBallBoost:
+	ld a, LIGHT_BALL
+	; fallthrough
+CheckAttackItemBoost:
 	push bc
 	push de
 	push hl
-	ld a, MON_SPECIES
+	ld b, a
 	call TrueUserPartyAttr
+	cp b
 	pop hl
-	cp PIKACHU
-	lb bc, PIKACHU, PIKACHU
-	ld d, LIGHT_BALL
-	jr z, .ok
-	lb bc, CUBONE, MAROWAK
-	ld d, THICK_CLUB
-.ok
-	call SpeciesItemBoost
-	pop de
-	pop bc
-	ret
-
-LightBallBoost:
-; Return in hl the stat value at hl.
-
-; If the attacking monster is Pikachu and it's
-; holding a Light Ball, double it.
-	push bc
-	push de
-	lb bc, PIKACHU, PIKACHU
-	ld d, LIGHT_BALL
-	call SpeciesItemBoost
+	call z, SpeciesItemBoost
 	pop de
 	pop bc
 	ret
 
 SpeciesItemBoost:
-; Return in hl the stat value at hl.
-
-; If the attacking monster is species b or c and
-; it's holding item d, double it.
-
-	ld a, [hli]
-	ld l, [hl]
-	ld h, a
-
-	push hl
-	ld a, MON_SPECIES
-	call TrueUserPartyAttr
-	pop hl
-
-	cp b
-	jr z, .GetItemHeldEffect
-	cp c
+; Helper function for items boosting (Sp.) Atk, i.e. Thick Club/Light Ball.
+	call TrueUserValidBattleItem
 	ret nz
 
-.GetItemHeldEffect:
-	push hl
-	call GetUserItem
-	ld a, [hl]
-	pop hl
-	cp d
-	ret nz
-
-; Double the stat
+	; Double the stat
 	add hl, hl
 	ret
 
@@ -3827,8 +3837,6 @@ BattleCommand_damagecalc:
 
 	; Variable-hit moves and Conversion can have a power of 0.
 	cp EFFECT_MULTI_HIT
-	jr z, .skip_zero_damage_check
-	cp EFFECT_FURY_STRIKES
 	jr z, .skip_zero_damage_check
 	cp EFFECT_CONVERSION
 	jr z, .skip_zero_damage_check
@@ -4243,9 +4251,7 @@ PlayFXAnimID:
 	ld c, 3
 	call DelayFrames
 
-	farcall PlayBattleAnim
-
-	ret
+	farjp PlayBattleAnim
 
 TakeOpponentDamage:
 ; user takes damage, doesn't apply berserk so don't run the regular damage func
@@ -4353,8 +4359,6 @@ SelfInflictDamageToSubstitute:
 	cp EFFECT_MULTI_HIT
 	jr z, .ok
 	cp EFFECT_DOUBLE_HIT
-	jr z, .ok
-	cp EFFECT_FURY_STRIKES
 	jr z, .ok
 	xor a
 	ld [hl], a
@@ -4473,13 +4477,7 @@ BattleCommand_sleep:
 	call UpdateBattleHuds
 	ld hl, FellAsleepText
 	call StdBattleTextbox
-	call PostStatus
-
-	; Check if we were cured
-	ld a, BATTLE_VARS_STATUS_OPP
-	cp 1 << SLP
-	jmp z, OpponentCantMove
-	ret
+	jr PostStatus
 
 .failed_ineffective
 	call AnimateFailedMove
@@ -4520,7 +4518,7 @@ CanSleepTarget:
 	ld a, b
 	lb bc, -1, -1
 	lb de, INSOMNIA, HELD_PREVENT_SLEEP
-	ld h, SLP
+	ld h, SLP_MASK
 CanStatusTarget:
 ; Input:
 ; a=0: Check Mold Breaker and Substitute (user directly poisoning foe)
@@ -4538,7 +4536,7 @@ CanStatusTarget:
 	ld a, BATTLE_VARS_STATUS_OPP
 	call GetBattleVar
 	and h
-	jr nz, .already_statused
+	jmp nz, .already_statused
 
 	; Corrosion bypasses everything except existing status problems
 	ld a, h
@@ -4597,6 +4595,9 @@ CanStatusTarget:
 	pop af
 	and a
 	jr nz, .no_mold_breaker
+	call SafeCheckSafeguard
+	ld hl, SafeguardProtectText
+	jr nz, .end
 	call CheckSubstituteOpp
 	ld hl, ButItFailedText
 	jr nz, .end
@@ -4785,7 +4786,7 @@ BattleCommand_burntarget:
 	call GetBattleVarAddr
 	and a
 	jr nz, Defrost
-	ld b, 0
+	ld b, a ; a == 0
 	call CanBurnTarget
 	ret nz
 	ld a, [wTypeModifier]
@@ -4873,11 +4874,7 @@ BattleCommand_freezetarget:
 
 	ld hl, WasFrozenText
 	call StdBattleTextbox
-
 	jmp PostStatus
-.no_magma_armor
-	call OpponentCantMove
-	jmp EndRechargeOpp
 
 BattleCommand_paralyzetarget:
 	xor a
@@ -5042,7 +5039,7 @@ DisplayStatusProblem:
 	ld l, a
 	jmp StdBattleTextbox
 
-status_problem: MACRO
+MACRO status_problem
 	db \1 ; status mask
 	dw \2 ; animation
 	dw \3 ; text
@@ -5054,7 +5051,7 @@ StatusProblemTable:
 	status_problem 1 << FRZ, ANIM_FRZ, FrozenSolidText
 	status_problem 1 << BRN, ANIM_BRN, WasBurnedText
 	status_problem 1 << PSN, ANIM_PSN, WasPoisonedText
-	status_problem      SLP, ANIM_SLP, FellAsleepText
+	status_problem SLP_MASK, ANIM_SLP, FellAsleepText
 
 BattleCommand_poison:
 	ld a, 1 << PSN
@@ -5152,7 +5149,7 @@ BattleCommand_rampage:
 ; No rampage during Sleep Talk.
 	ld a, BATTLE_VARS_STATUS
 	call GetBattleVar
-	and SLP
+	and SLP_MASK
 	ret nz
 
 	call CheckRampageStatusAndGetRolloutCount
@@ -5262,8 +5259,8 @@ CheckIfTrappedByAbility:
 
 SetBattleDraw:
 	ld a, [wBattleResult]
-	and $c0
-	or $2
+	and BATTLERESULT_BITMASK
+	or DRAW
 	ld [wBattleResult], a
 	ret
 
@@ -5273,15 +5270,14 @@ BattleCommand_switchout:
 	ld a, 1 << SWITCH_DEFERRED | 1 << SWITCH_PURSUIT
 	; fallthrough
 SetDeferredSwitch:
-	push af
-	ld a, [wDeferredSwitch]
-	and a
+	push hl
+	ld hl, wDeferredSwitch
+	inc [hl]
+	dec [hl]
 	jr nz, .done
-	pop af
-	ld [wDeferredSwitch], a
-	push af
+	ld [hl], a
 .done
-	pop af
+	pop hl
 	ret
 
 InvertDeferredSwitch:
@@ -5384,7 +5380,7 @@ BattleCommand_flinchtarget:
 
 	ld a, BATTLE_VARS_STATUS_OPP
 	call GetBattleVar
-	and 1 << FRZ | SLP
+	and 1 << FRZ | SLP_MASK
 	ret nz
 
 	call CheckOpponentWentFirst
@@ -5424,7 +5420,7 @@ BattleCommand_charge:
 .not_charging
 	ld a, BATTLE_VARS_STATUS
 	call GetBattleVar
-	and SLP
+	and SLP_MASK
 	jr z, .awake
 
 	call BattleCommand_movedelay
@@ -5527,12 +5523,6 @@ BattleCommand_traptarget:
 	ret nz
 	call CheckSubstituteOpp
 	ret nz
-	push bc
-	push de
-	call CheckIfTargetIsGhostType
-	pop de
-	pop bc
-	ret z
 	push bc
 	push de
 	push hl
@@ -5774,15 +5764,15 @@ BattleCommand_resetstats:
 
 BattleCommand_heal:
 	farcall CheckFullHP
-	jmp z, .hp_full
+	jr z, .hp_full
 	ld a, BATTLE_VARS_MOVE_ANIM
 	call GetBattleVar
 	cp REST
 	jr nz, .not_rest
 	ld a, BATTLE_VARS_STATUS
 	call GetBattleVar
-	and SLP
-	jmp nz, BattleEffect_ButItFailed
+	and SLP_MASK
+	jr nz, BattleEffect_ButItFailed
 	call GetTrueUserAbility
 	cp INSOMNIA
 	jr z, .ability_prevents_rest
@@ -5806,28 +5796,6 @@ BattleCommand_heal:
 .not_rest
 	call GetHalfMaxHP
 .finish
-
-; Softboiled and Milk Drink were merged into Fresh Snack, so use the correct
-; animation for the Pokémon that learned each one
-	ld a, BATTLE_VARS_MOVE_ANIM
-	call GetBattleVar
-	cp FRESH_SNACK
-	ld a, 0
-	jr nz, .not_fresh_snack
-	ldh a, [hBattleTurn]
-	and a
-	ld a, [wBattleMonSpecies]
-	jr z, .got_user_species
-	ld a, [wEnemyMonSpecies]
-.got_user_species
-	cp MILTANK
-	ld a, 0
-	jr nz, .got_kick_counter
-	inc a
-.got_kick_counter
-	ld [wKickCounter], a
-.not_fresh_snack
-
 	call AnimateCurrentMove
 	farcall RestoreHP
 	call UpdateUserInParty
@@ -6185,67 +6153,6 @@ BattleCommand_doubleminimizedamage:
 	ld [hl], a
 	ret
 
-GetFutureSightUser::
-; Returns:
-; c|z: Regular user in a (Future Sight not involved)
-; nc|z: Active user in a (Future Sight applying)
-; nc|nz: External user in a (or active fainted), future sight applying.
-	push hl
-	push de
-	push bc
-	ldh a, [hBattleTurn]
-	and a
-	ld hl, wPlayerFutureSightCount
-	ld bc, wCurBattleMon
-	jr z, .got_future
-	ld hl, wEnemyFutureSightCount
-	ld bc, wCurOTMon
-.got_future
-	ld a, [hl]
-	and a
-	jr z, .future_sight_offline
-	and $f
-	jr nz, .future_sight_offline
-	ld a, [hl]
-	swap a
-	dec a
-	and $f
-	ld d, a
-	ld a, [bc]
-	cp d
-	ld a, d
-	pop bc
-	pop de
-	pop hl
-	scf
-	ccf
-	ret nz
-
-	; If user is fainted, treat as non-active
-	push af
-	push hl
-	call HasUserFainted
-	pop hl
-	jr z, .active_fainted
-	pop af
-	ret
-
-.active_fainted
-	pop af
-	and a
-	ret nz
-	rrca
-	ret
-
-.future_sight_offline
-	xor a
-	ld a, [bc]
-	pop bc
-	pop de
-	pop hl
-	scf
-	ret
-
 _GetTrueUserAbility::
 ; Returns current user's ability, or 0 (no ability) for external future sight user
 ; Also returns 0 (no ability) if opponent has Neutralizing Gas and user doesn't
@@ -6532,6 +6439,56 @@ AppearUserLowerSub:
 
 AppearUserRaiseSub:
 	farjp _AppearUserRaiseSub
+
+CheckBattleAnimSubstitution:
+; Checks the animation ID and possibly change it based on species.
+	assert !HIGH(NUM_ATTACKS), "This function is now obsolete."
+
+	; Moves are 1-255.
+	ld a, [wFXAnimIDHi]
+	and a
+	ret nz
+
+	ld a, [wFXAnimIDLo]
+	cp FRESH_SNACK
+	ld de, ANIM_MILK_DRINK
+	ld hl, .MilkDrinkUsers
+	jr z, .check_species_list
+	cp FURY_STRIKES
+	ld de, ANIM_FURY_ATTACK
+	ld hl, FuryAttackUsers
+	jr z, .check_species_list
+	cp DEFENSE_CURL
+	ret nz
+
+	; Defense Curl has 3 variations
+	ld de, ANIM_WITHDRAW
+	ld hl, WithdrawUsers
+	call .check_species_list
+	ld de, ANIM_HARDEN
+	ld hl, HardenUsers
+	; fallthrough
+.check_species_list
+	push hl
+	ld hl, wBattleMonSpecies
+	call GetUserMonAttr
+	ld a, [hl]
+	ld bc, wBattleMonForm - wBattleMonSpecies
+	add hl, bc
+	ld c, a
+	ld b, [hl]
+	pop hl
+	call GetSpeciesAndFormIndexFromHL
+	ret nc
+	ld a, e
+	ld [wFXAnimIDLo], a
+	ld a, d
+	ld [wFXAnimIDHi], a
+	ret
+
+.MilkDrinkUsers:
+	dp MILTANK
+	db 0
 
 _CheckBattleEffects:
 ; Checks the options. Returns carry if battle animations are disabled.
